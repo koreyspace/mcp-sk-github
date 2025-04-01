@@ -1,0 +1,12 @@
+[project]
+name = "mcp-sk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chainlit>=2.4.400",
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.6.0",
+    "semantic-kernel>=1.26.1",
+]
