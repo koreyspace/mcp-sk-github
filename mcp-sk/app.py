@@ -16,6 +16,13 @@ from semantic_kernel.contents.function_call_content import FunctionCallContent
 from semantic_kernel.contents.function_result_content import FunctionResultContent
 from semantic_kernel.connectors.mcp import MCPStdioPlugin
 from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
+from semantic_kernel.agents import ChatCompletionAgent, ChatHistoryAgentThread, AgentGroupChat
+from semantic_kernel.agents.strategies import (
+    KernelFunctionSelectionStrategy,
+    KernelFunctionTerminationStrategy,
+    SequentialSelectionStrategy,
+    DefaultTerminationStrategy
+)
 
 
 
@@ -109,6 +116,7 @@ async def on_chat_start():
     # Define service ID
     service_id = "agent"
 
+  
 
 
     # Create and add chat completion service
@@ -149,10 +157,53 @@ async def on_chat_start():
         
         # Store the plugin in user session for cleanup later
         cl.user_session.set("github_plugin", github_plugin)
+
+
         
         print("GitHub plugin added successfully")
     except Exception as e:
         print(f"Error adding GitHub plugin: {str(e)}")
+
+
+
+    GITHUB_INSTRUCTIONS ="""
+    You are good at answering questions about Github repositories, who created them, the programming languages used and information based on files and README.md
+    """
+
+    HACKATHON_AGENT = """
+        You are good at winning hackathons through amazingly creative ideas on building AI Agents!
+        You use the Github agent to get information about repositories and their owners.
+        Every suggestion you make should be based on the Github Activity (repos, programming languages, tools used) of a user and give a detailed description of the idea.
+        Your suggestions should be based on winning the AI Agent Hackathon from Microsoft. Give reasons why they are a good suggestion. Here are the prizes for the hackathon:
+        Best Overall Agent - $20,000
+        Best Agent in Python - $5,000
+        Best Agent in C# - $5,000
+        Best  Agent in Java - $5,000
+        Best    Agent in JavaScript/TypeScript - $5,000
+        Best    Copilot Agent (using Microsoft Copilot Studio or Microsoft 365 Agents SDK) - $5,000
+        Best    Azure AI Agent Service Usage - $5,000
+        
+"""
+
+    github_agent = ChatCompletionAgent(
+            service=AzureChatCompletion(),
+            name="GithubAgent",
+            instructions=GITHUB_INSTRUCTIONS,
+            plugins=[github_plugin]
+        )
+
+    hackathon_agent = ChatCompletionAgent(
+        service=AzureChatCompletion(),
+        name="HackathonAgent",
+        instructions=HACKATHON_AGENT
+    )
+
+    # Create the agent group chat
+    agent_group_chat = AgentGroupChat(
+        agents=[github_agent, hackathon_agent],
+        selection_strategy=SequentialSelectionStrategy(initial_agent=hackathon_agent),
+        termination_strategy=DefaultTerminationStrategy(maximum_iterations=5)
+    )
 
     # Create a new chat history
     chat_history = ChatHistory()
@@ -160,10 +211,10 @@ async def on_chat_start():
     # Store in user session
     cl.user_session.set("kernel", kernel)
     cl.user_session.set("settings", settings)  # Store settings in session
-
     cl.user_session.set("chat_completion_service", AzureChatCompletion())
     cl.user_session.set("chat_history", chat_history)
     cl.user_session.set("mcp_tools", {})
+    cl.user_session.set("agent_group_chat", agent_group_chat)  # Store the agent group chat
 
 
 # Add a cleanup handler for when the session ends
@@ -181,44 +232,70 @@ async def on_chat_end():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    # First get kernel from the user session
     kernel = cl.user_session.get("kernel")
-    
-    # Get the chat completion service
     chat_completion_service = cl.user_session.get("chat_completion_service")
     chat_history = cl.user_session.get("chat_history")
     settings = cl.user_session.get("settings")
+    agent_group_chat = cl.user_session.get("agent_group_chat")
 
+    # Check if the message is requesting a hackathon project recommendation
+    user_input = message.content.lower()
+    if "recommend" in user_input and "hackathon" in user_input and "github" in user_input:
+        # Create a Chainlit message for the response stream
+        answer = cl.Message(content="")
+        await answer.send()
 
-    # Get execution settings and enable function calling
-    
-    # Important: Enable function calling with auto-mode
-    
-    # Add user message to history
-    chat_history.add_user_message(message.content)
+        # Add user message to chat history
+        chat_history.add_user_message(message.content)
+        
+        # Use the agent group chat for processing
+        await agent_group_chat.add_chat_message(message.content)
+        
+        # Create message for response stream
+        answer = cl.Message(content="")
+        await answer.stream_token("Processing your request using GitHub and Hackathon agents...\n\n")
+        
+        agent_responses = []
+        async for content in agent_group_chat.invoke():
+            agent_name = content.name or "Agent"
+            response = f"**{agent_name}**: {content.content}"
+            agent_responses.append(response)
+            await answer.stream_token(f"{response}\n\n")
+        
+        # Add the full agent responses to chat history
+        full_response = "\n\n".join(agent_responses)
+        chat_history.add_assistant_message(full_response)
+        
+        # Update the message with all responses
+        answer.content = full_response
+        await answer.update()
+    else:
+        # Regular processing for other messages
+        # Add user message to history
+        chat_history.add_user_message(message.content)
 
-    # Create a Chainlit message for the response stream
-    answer = cl.Message(content="")
+        # Create a Chainlit message for the response stream
+        answer = cl.Message(content="")
 
-    async for msg in chat_completion_service.get_streaming_chat_message_content(
-        chat_history=chat_history,
-        user_input=message.content,
-        settings=settings,
-        kernel=kernel,
-    ):
-        if msg.content:
-            await answer.stream_token(msg.content)
-        # Handle function calls if they occur
-        if isinstance(msg, FunctionCallContent):
-            function_name = msg.function_name
-            function_arguments = msg.arguments
-            await answer.stream_token(f"\n\nCalling function: {function_name} with arguments: {function_arguments}\n\n")
-        # Handle function results
-        if isinstance(msg, FunctionResultContent):
-            await answer.stream_token(f"Function result: {msg.content}\n\n")
+        async for msg in chat_completion_service.get_streaming_chat_message_content(
+            chat_history=chat_history,
+            user_input=message.content,
+            settings=settings,
+            kernel=kernel,
+        ):
+            if msg.content:
+                await answer.stream_token(msg.content)
+            # Handle function calls if they occur
+            if isinstance(msg, FunctionCallContent):
+                function_name = msg.function_name
+                function_arguments = msg.arguments
+                await answer.stream_token(f"\n\nCalling function: {function_name} with arguments: {function_arguments}\n\n")
+            # Handle function results
+            if isinstance(msg, FunctionResultContent):
+                await answer.stream_token(f"Function result: {msg.content}\n\n")
 
-    # Add the full assistant response to history
-    chat_history.add_assistant_message(answer.content)
+        # Add the full assistant response to history
+        chat_history.add_assistant_message(answer.content)
 
-    # Send the final message
-    await answer.send()
+        # Send the final message
+        await answer.send()
