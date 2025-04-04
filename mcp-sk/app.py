@@ -25,7 +25,6 @@ from semantic_kernel.agents.strategies import (
 )
 
 
-
 # Load environment variables
 load_dotenv()
 
@@ -41,10 +40,6 @@ class WeatherPlugin:
             return f"The weather in {city} is 15°C and cloudy."
         else:
             return f"Sorry, I don't have the weather for {city}."
-
-
-
-
 
 
 def flatten(xss):
@@ -116,25 +111,19 @@ async def on_chat_start():
     # Define service ID
     service_id = "agent"
 
-  
-
-
     # Create and add chat completion service
     # chat_completion_service = OpenAIChatCompletion(
     #     ai_model_id="gpt-4o-mini",
     #     async_client=client,
     #     service_id=service_id
     # )
-    
+
     sk_filter = cl.SemanticKernelFilter(kernel=kernel)
 
-    
     kernel.add_service(AzureChatCompletion(service_id=service_id))
     settings = kernel.get_prompt_execution_settings_from_service_id(
         service_id=service_id)
     settings.function_choice_behavior = FunctionChoiceBehavior.Auto()
-
-
 
     # Add WeatherPlugin
     kernel.add_plugin(WeatherPlugin(), plugin_name="Weather")
@@ -148,49 +137,70 @@ async def on_chat_start():
             command="npx",
             args=["-y", "@modelcontextprotocol/server-github"]
         )
-        
+
         # Connect to the GitHub MCP server
         await github_plugin.connect()
-        
+
         # Add the plugin to the kernel
         kernel.add_plugin(github_plugin)
-        
+
         # Store the plugin in user session for cleanup later
         cl.user_session.set("github_plugin", github_plugin)
 
-
-        
         print("GitHub plugin added successfully")
     except Exception as e:
         print(f"Error adding GitHub plugin: {str(e)}")
 
+    GITHUB_INSTRUCTIONS = """
+You are an expert on GitHub repositories. When answering questions, you **must** use the provided GitHub username to find specific information about that user's repositories, including:
 
+*   Who created the repositories
+*   The programming languages used
+*   Information found in files and README.md files within those repositories
+*   Provide links to each repository referenfced in your answers
 
-    GITHUB_INSTRUCTIONS ="""
-    You are good at answering questions about Github repositories, who created them, the programming languages used and information based on files and README.md
+**Important:** Never perform general searches for repositories. Always use the given GitHub username to find the relevant information. If a GitHub username is not provided, state that you need a username to proceed.
     """
 
     HACKATHON_AGENT = """
-        You are good at winning hackathons through amazingly creative ideas on building AI Agents!
-        You use the Github agent to get information about repositories and their owners.
-        Every suggestion you make should be based on the Github Activity (repos, programming languages, tools used) of a user and give a detailed description of the idea.
-        Your suggestions should be based on winning the AI Agent Hackathon from Microsoft. Give reasons why they are a good suggestion. Here are the prizes for the hackathon:
-        Best Overall Agent - $20,000
-        Best Agent in Python - $5,000
-        Best Agent in C# - $5,000
-        Best  Agent in Java - $5,000
-        Best    Agent in JavaScript/TypeScript - $5,000
-        Best    Copilot Agent (using Microsoft Copilot Studio or Microsoft 365 Agents SDK) - $5,000
-        Best    Azure AI Agent Service Usage - $5,000
+You are an AI Agent Hackathon Strategist specializing in recommending winning project ideas.
+
+Your task:
+1. Analyze the GitHub activity of users to understand their technical skills
+2. Suggest creative AI Agent projects tailored to their expertise. 
+3. Focus on projects that align with Microsoft's AI Agent Hackathon prize categories
+
+When making recommendations:
+- Base your ideas strictly on the user's GitHub repositories, languages, and tools
+- Give suggestions on tools, languaghes and framweworks to use to build it. 
+- Provide detailed project descriptions including architecture and implementation approach
+- Explain why the project has potential to win in specific prize categories
+- Highlight technical feasibility given the user's demonstrated skills by referencing the specific repositories or languages used.
+
+Formatting your response:
+- Provide a clear and structured response that includes:
+    - Suggested Project Name
+    - Project Description 
+    - Potential languages and tools to use
+    - Link to each relevant GitHub repository you based your recommendation on
+
+Hackathon prize categories:
+- Best Overall Agent ($20,000)
+- Best Agent in Python ($5,000)
+- Best Agent in C# ($5,000)
+- Best Agent in Java ($5,000)
+- Best Agent in JavaScript/TypeScript ($5,000)
+- Best Copilot Agent using Microsoft Copilot Studio or Microsoft 365 Agents SDK ($5,000)
+- Best Azure AI Agent Service Usage ($5,000)
         
 """
 
     github_agent = ChatCompletionAgent(
-            service=AzureChatCompletion(),
-            name="GithubAgent",
-            instructions=GITHUB_INSTRUCTIONS,
-            plugins=[github_plugin]
-        )
+        service=AzureChatCompletion(),
+        name="GithubAgent",
+        instructions=GITHUB_INSTRUCTIONS,
+        plugins=[github_plugin]
+    )
 
     hackathon_agent = ChatCompletionAgent(
         service=AzureChatCompletion(),
@@ -201,7 +211,8 @@ async def on_chat_start():
     # Create the agent group chat
     agent_group_chat = AgentGroupChat(
         agents=[github_agent, hackathon_agent],
-        selection_strategy=SequentialSelectionStrategy(initial_agent=hackathon_agent),
+        selection_strategy=SequentialSelectionStrategy(
+            initial_agent=github_agent),
         termination_strategy=DefaultTerminationStrategy(maximum_iterations=5)
     )
 
@@ -214,7 +225,8 @@ async def on_chat_start():
     cl.user_session.set("chat_completion_service", AzureChatCompletion())
     cl.user_session.set("chat_history", chat_history)
     cl.user_session.set("mcp_tools", {})
-    cl.user_session.set("agent_group_chat", agent_group_chat)  # Store the agent group chat
+    # Store the agent group chat
+    cl.user_session.set("agent_group_chat", agent_group_chat)
 
 
 # Add a cleanup handler for when the session ends
@@ -240,32 +252,28 @@ async def on_message(message: cl.Message):
 
     # Check if the message is requesting a hackathon project recommendation
     user_input = message.content.lower()
-    if "recommend" in user_input and "hackathon" in user_input and "github" in user_input:
-        # Create a Chainlit message for the response stream
-        answer = cl.Message(content="")
-        await answer.send()
-
+    if "recommend" and "github" in user_input:
         # Add user message to chat history
         chat_history.add_user_message(message.content)
-        
-        # Use the agent group chat for processing
+
+        # Add user message to the agent group chat's channel
         await agent_group_chat.add_chat_message(message.content)
-        
-        # Create message for response stream
-        answer = cl.Message(content="")
-        await answer.stream_token("Processing your request using GitHub and Hackathon agents...\n\n")
-        
+
+        # Create message for response stream - USE ONLY ONE MESSAGE OBJECT
+        answer = cl.Message(content="Processing your request using GitHub and Hackathon agents...\n\n")
+        await answer.send()
+
         agent_responses = []
         async for content in agent_group_chat.invoke():
             agent_name = content.name or "Agent"
             response = f"**{agent_name}**: {content.content}"
             agent_responses.append(response)
             await answer.stream_token(f"{response}\n\n")
-        
+
         # Add the full agent responses to chat history
         full_response = "\n\n".join(agent_responses)
         chat_history.add_assistant_message(full_response)
-        
+
         # Update the message with all responses
         answer.content = full_response
         await answer.update()
