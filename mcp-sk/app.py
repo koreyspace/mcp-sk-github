@@ -213,7 +213,7 @@ Hackathon prize categories:
         agents=[github_agent, hackathon_agent],
         selection_strategy=SequentialSelectionStrategy(
             initial_agent=github_agent),
-        termination_strategy=DefaultTerminationStrategy(maximum_iterations=5)
+        termination_strategy=DefaultTerminationStrategy(maximum_iterations=3)
     )
 
     # Create a new chat history
@@ -249,10 +249,14 @@ async def on_message(message: cl.Message):
     chat_history = cl.user_session.get("chat_history")
     settings = cl.user_session.get("settings")
     agent_group_chat = cl.user_session.get("agent_group_chat")
+    sk_filter = cl.SemanticKernelFilter(kernel=kernel)
+
 
     # Check if the message is requesting a hackathon project recommendation
     user_input = message.content.lower()
     if "recommend" and "github" in user_input:
+        sk_filter = cl.SemanticKernelFilter(kernel=kernel)
+
         # Add user message to chat history
         chat_history.add_user_message(message.content)
 
