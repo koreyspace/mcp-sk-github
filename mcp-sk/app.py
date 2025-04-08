@@ -7,6 +7,8 @@ import chainlit as cl
 from mcp import ClientSession
 
 from semantic_kernel.kernel import Kernel
+from azure.core.credentials import AzureKeyCredential
+
 
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
 from semantic_kernel.functions import KernelFunction, kernel_function
@@ -24,6 +26,10 @@ from semantic_kernel.agents.strategies import (
     DefaultTerminationStrategy
 )
 
+from azure.search.documents import SearchClient
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.indexes.models import SearchIndex, SimpleField, SearchFieldDataType, SearchableField
+
 
 # Load environment variables
 load_dotenv()
@@ -40,7 +46,89 @@ class WeatherPlugin:
             return f"The weather in {city} is 15°C and cloudy."
         else:
             return f"Sorry, I don't have the weather for {city}."
+        
 
+class RAGPlugin:
+    def __init__(self, search_client):
+        self.search_client = search_client
+
+    @kernel_function(name="search_events", description="Searches for relevant events based on a query")
+    def search_events(self, query: str) -> str:
+        """Retrieves relevant events from Azure Search based on the query."""
+        try:
+            results = self.search_client.search(query, top=5)
+            context_strings = []
+            for result in results:
+                if 'content' in result:
+                    context_strings.append(f"Event: {result['content']}")
+
+            if context_strings:
+                return "\n\n".join(context_strings)
+            else:
+                return "No relevant events found."
+        except Exception as e:
+            return f"Error searching for events: {str(e)}"
+
+
+# Initialize Azure AI Search with persistent storage
+search_service_endpoint = os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
+search_api_key = os.getenv("AZURE_SEARCH_API_KEY")
+index_name = "event-descriptions"
+
+search_client = SearchClient(
+    endpoint=search_service_endpoint,
+    index_name=index_name,
+    credential=AzureKeyCredential(search_api_key)
+)
+
+index_client = SearchIndexClient(
+    endpoint=search_service_endpoint,
+    credential=AzureKeyCredential(search_api_key)
+)
+
+# Define the index schema
+fields = [
+    SimpleField(name="id", type=SearchFieldDataType.String, key=True),
+    SearchableField(name="content", type=SearchFieldDataType.String)
+]
+
+index = SearchIndex(name=index_name, fields=fields)
+
+# Check if index already exists if not, create it
+try:
+    existing_index = index_client.get_index(index_name)
+    print(f"Index '{index_name}' already exists, using the existing index.")
+except Exception as e:
+    # Create the index if it doesn't exist
+    print(f"Creating new index '{index_name}'...")
+    index_client.create_index(index)
+
+# Always read event descriptions from markdown file
+with open("event-descriptions.md", "r") as f:
+    markdown_content = f.read()
+
+# Split the markdown content into individual event descriptions
+event_descriptions = markdown_content.split("---")  # You can change the delimiter
+
+# Create documents for Azure Search
+documents = []
+for i, description in enumerate(event_descriptions):
+    description = description.strip()  # Remove leading/trailing whitespace
+    if description:  # Avoid empty descriptions
+        documents.append({"id": str(i + 1), "content": description})
+
+# Add documents to the index (only if we have documents)
+if documents:
+    # Delete existing documents first to avoid duplicates
+    try:
+        search_client.delete_documents(documents=[{"id": doc["id"]} for doc in documents])
+        print("Cleared existing documents")
+    except Exception as e:
+        print(f"Warning: Failed to clear existing documents: {str(e)}")
+    
+    # Upload new documents
+    search_client.upload_documents(documents)
+    print(f"Uploaded {len(documents)} documents to index")
 
 def flatten(xss):
     return [x for xs in xss for x in xs]
@@ -128,6 +216,15 @@ async def on_chat_start():
     # Add WeatherPlugin
     kernel.add_plugin(WeatherPlugin(), plugin_name="Weather")
 
+    # Create a properly instantiated RAGPlugin
+    rag_plugin = RAGPlugin(search_client)
+
+    # Add to kernel
+    kernel.add_plugin(rag_plugin, plugin_name="RAG")
+
+    # Store in session
+    cl.user_session.set("rag_plugin", rag_plugin)
+
     # Add GitHub MCP plugin
     try:
         # Create GitHub MCP plugin using MCPStdioPlugin
@@ -195,6 +292,37 @@ Hackathon prize categories:
         
 """
 
+    EVENTS_AGENT = """
+You are an Event Recommendation Agent specializing in suggesting relevant tech events.
+
+Your task:
+1. Review the project idea recommended by the Hackathon Agent
+2. Use the search_events function to find relevant events based on the technologies mentioned.
+3. NEVER suggest and event that the where there is not a relevant technology that the user has used.
+3. ONLY recommend events that were returned by the search_events functionf
+
+When making recommendations:
+- IMPORTANT: You must first call the search_events function with appropriate technology keywords from the project
+- Only recommend events that were explicitly returned by the search_events function
+- Do not make up or suggest events that weren't in the search results
+- Construct search queries using specific technologies mentioned (e.g., "Python AI workshop" or "JavaScript hackathon")
+- Try multiple search queries if needed to find the most relevant events
+
+
+For each recommended event:
+- Only include events found in the search_events results
+- Explain the direct connection between the event and the specific project requirements
+- Highlight relevant workshops, sessions, or networking opportunities
+
+Formatting your response:
+- Start with "Based on the hackathon project idea, here are relevant events that I found:"
+- Only list events that were returned by the search_events function
+- For each event, include the exact event details as returned by search_events
+- Explain specifically how each event relates to the project technologies
+
+If no relevant events are found, acknowledge this and suggest trying different search terms instead of making up events.
+"""
+
     github_agent = ChatCompletionAgent(
         service=AzureChatCompletion(),
         name="GithubAgent",
@@ -208,9 +336,16 @@ Hackathon prize categories:
         instructions=HACKATHON_AGENT
     )
 
+    events_agent = ChatCompletionAgent(
+        service=AzureChatCompletion(),
+        name="EventsAgent",
+        instructions=EVENTS_AGENT,
+        plugins=[rag_plugin]  # Add the plugin here
+    )
+
     # Create the agent group chat
     agent_group_chat = AgentGroupChat(
-        agents=[github_agent, hackathon_agent],
+        agents=[github_agent, hackathon_agent, events_agent],
         selection_strategy=SequentialSelectionStrategy(
             initial_agent=github_agent),
         termination_strategy=DefaultTerminationStrategy(maximum_iterations=3)
@@ -264,7 +399,7 @@ async def on_message(message: cl.Message):
         await agent_group_chat.add_chat_message(message.content)
 
         # Create message for response stream - USE ONLY ONE MESSAGE OBJECT
-        answer = cl.Message(content="Processing your request using GitHub and Hackathon agents...\n\n")
+        answer = cl.Message(content="Processing your request using GitHub, Hackathon and Events agents...\n\n")
         await answer.send()
 
         agent_responses = []
